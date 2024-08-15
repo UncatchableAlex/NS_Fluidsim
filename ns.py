@@ -12,7 +12,8 @@ from multiprocessing.pool import Pool
 # Sources:
 # Stable Fluids, Stam 1999   https://pages.cs.wisc.edu/~chaol/data/cs777/stam-stable_fluids.pdf
 # Fast Fluid Dynamics Simulation on the GPU, Harris 2004           https://cg.informatik.uni-freiburg.de/intern/seminar/gridFluids_GPU_Gems.pdf
-def navier_stokes(x_range, n, t_max, iters, num_particles, chunk_size, name, init_U_func=lambda x,y: (0, 0), F=lambda X,Y,t: (X,Y,t), objects=lambda X,Y,t:np.zeros_like(X), viscosity=-20):
+def navier_stokes(x_range, n, t_max, iters, num_particles, chunk_size, name, init_U_func=lambda x,y: (0, 0), F=[lambda X,Y,t: (X,Y,t)], viscosity=-20):
+    plt.style.use('dark_background')
     num_particles = int(num_particles)
     dx = (x_range[1] - x_range[0]) / n
     dt = t_max / iters
@@ -83,9 +84,9 @@ def navier_stokes(x_range, n, t_max, iters, num_particles, chunk_size, name, ini
     for i in tqdm(range(0, iters), total=iters, desc="Navier-Stokes Solver"):
         W0 = U[1]
         ########################################    FORCING      ################################################
-        force =  F(x_range[0] + row_idx*dx, x_range[0] + col_idx*dx, i*dt)
-        W0[:, :, 0] += force[0]
-        W0[:, :, 1] += force[1]
+        for f in F:
+            W0 = f(W0, row_idx, col_idx, i*dt)
+        
         U[2] = W1 = W0
         ########################################    ADVECTION    ################################################
         # find the index of each particle's velocity one step ago:
@@ -109,16 +110,6 @@ def navier_stokes(x_range, n, t_max, iters, num_particles, chunk_size, name, ini
         div_py = (p[1:-1, 2:] - p[1:-1, 0:-2])/(2*dx)
         div_p = np.dstack((div_px, div_py))
         U[2, 2:-2, 2:-2] = W3[2:-2, 2:-2] - div_p
-        ######################################     BOUNDARIES & OBJECTS   ###############################################
-        # update our boundary conditions like Harris in GPU Gems:
-        #U[1, 0:2, 2:-2] = 0#U[1, 3, 2:-2] # top boundary
-        #U[1, -3:-1, 2:-2] = 0# U[1, -3, 2:-2] # bottom boundary
-        #U[1, 2:-2, 0:2] = U[1, 2:-2, 3:4] # left boundary
-        U[2, 2:-2, -2:] = 0#U[1, 2:-2, -2:]  # right boundary
-
-        obj_mask = objects(x_range[0] + row_idx*dx, x_range[0] + col_idx*dx, i*dt)
-        U[2, obj_mask,:] = 0
-        # shift 
         U[0] = U[1]
         U[1] = U[2]
 
@@ -182,8 +173,6 @@ def render(name, chunk_size, iters):
         '-safe', '0',
         '-i', file_list,
         '-c', 'copy',
-        '-b:v', '5000k',
-        '-bufsize', '7500k',
         f'{name}.mp4'
     ]
 
@@ -207,12 +196,10 @@ def render_section(start_frame, end_frame, async_frames):
         '-pix_fmt', 'argb',
         '-r', '60',
         '-i', 'pipe:0',
-        '-crf', '17',
-        '-pass', '1',
-        '-an',
-        '-c:v', 'libvpx-vp9',
+        '-c:v', 'libx264',
         '-b:v', '0',
-        'NUL && ^'
+        '-crf', '10',
+        '-preset', 'veryslow',
         f'ffmpeg_temp/{start_frame}_{end_frame}.mp4'
     ]
     # Run FFmpeg with input data piped to stdin
@@ -228,13 +215,18 @@ def render_section(start_frame, end_frame, async_frames):
             if stderr_data:
                 print(f"FFmpeg stderr: {stderr_data.decode('utf-8')}")
             break
-
+    
+    sub_process.stdin.close()
     stdout_data, stderr_data = sub_process.communicate()
     if sub_process.returncode != 0:
         print(f"FFmpeg error: {stderr_data.decode('utf-8')}")
+    # close all figures that are still open for any reason:
+  #  plt.close('all')
 
 # Function to update the plot
 def draw_frame(x_range, u, particle_positions, pressure):
+    u = np.flip(u, axis=0)
+    pressure = np.flip(pressure, axis=0)
     # define the figure that we will plot with
     #fig, (mag_ax, particle_ax, pressure_ax) = plt.subplots(nrows=3, ncols=1, figsize=(4, 14), sharex=True, subplot_kw={'xticks': [], 'yticks': []}, layout='constrained')
     fig, (mag_ax, pressure_ax) = plt.subplots(nrows=2, ncols=1, figsize=(4, 9), sharex=True, subplot_kw={'xticks': [], 'yticks': []}, layout='constrained')
@@ -244,7 +236,7 @@ def draw_frame(x_range, u, particle_positions, pressure):
     mag_ax.set_title("Speed (m/s)")
     norm = np.sqrt(u[:, :, 0]**2 + u[:, :, 1]**2)  # Calculate the magnitude of the vectors
     # Plot the vector field magnitude
-    mag_ax.imshow(norm[:, 50:], cmap='viridis', extent=[x_range[0], x_range[1], x_range[0], x_range[1]])
+    mag_ax.imshow(norm, cmap='viridis', extent=[x_range[0], x_range[1], x_range[0], x_range[1]])
     mag_ax.set_xlim(x_range[0], x_range[1])
     mag_ax.set_ylim(x_range[0], x_range[1])
     mag_ax.set_xticks([])
@@ -260,7 +252,7 @@ def draw_frame(x_range, u, particle_positions, pressure):
 
     pressure_ax.clear()
     pressure_ax.set_title("Pressure (Pa)")
-    pressure_ax.imshow(pressure[:, 50:], cmap='viridis', extent=[x_range[0], x_range[1], x_range[0], x_range[1]])
+    pressure_ax.imshow(pressure, cmap='viridis', extent=[x_range[0], x_range[1], x_range[0], x_range[1]])
     pressure_ax.set_xlim(x_range[0], x_range[1])
     pressure_ax.set_ylim(x_range[0], x_range[1])
     # remove annoying tick marks:
@@ -268,49 +260,13 @@ def draw_frame(x_range, u, particle_positions, pressure):
     pressure_ax.set_yticks([])
     
     # add colorbars:
-    vmin_mag = np.min(norm[:, 50:])
-    vmax_mag = np.max(norm[:, 50:])
-    vmin_pressure = np.min(pressure[:, 50:])
-    vmax_pressure = np.max(pressure[:, 50:])
+    vmin_mag = 0#np.min(norm[:, 50:])
+    vmax_mag = 5#np.max(norm[:, 50:])
+    vmin_pressure = -0.02#np.min(pressure[100:-100, 50:])
+    vmax_pressure = 0.04 #np.max(pressure[100:-100, 50:])
     fig.colorbar(cm.ScalarMappable(cmap='viridis', norm=colors.Normalize(vmin=vmin_mag, vmax=vmax_mag)), ax=mag_ax, shrink=0.8, orientation='horizontal', pad=0.02)
     fig.colorbar(cm.ScalarMappable(cmap='viridis', norm=colors.Normalize(vmin=vmin_pressure, vmax=vmax_pressure)), ax=pressure_ax, shrink=0.8, orientation='horizontal', pad=0.02)
     fig.canvas.draw()
     res = fig.canvas.tostring_argb()
     plt.close(fig)
     return res
-
-
-def left(X,Y,t,amplitude=5):
-    u = np.zeros_like(X)
-    v = np.zeros_like(Y)
-    #u = amplitude
-    #middle = np.average(Y[0])
-    #mags = -amplitude * np.linspace(Y[0][2] - middle, Y[0][-2] - middle, len(Y[0]) - 4)**2
-    #mags -= np.min(mags)
-    #rep_mags = np.repeat(mags[:, np.newaxis], repeats=10, axis=1)
-    v[:, 0:40] = amplitude
-    
-    return u,v
-
-
-def NACA_airfoil(X, Y, t, m=0.06, p=0.4, r=0.09):
-    x = Y[0]
-    t = r
-    yc = (m / (p**2)) * (2 * p * x - x**2) * (x <= p) + (m / ((1 - p)**2)) * ((1 - 2 * p) + 2 * p * x - x**2) * (x > p)
-    yt = 5 * t * (0.2969 * np.sqrt(x) - 0.1260 * x - 0.3516 * x**2 + 0.2843 * x**3 - 0.1015 * x**4)
-    dyc_dx = (2 * m / (p**2)) * (p - x) * (x <= p) + (2 * m / ((1 - p)**2)) * (p - x) * (x > p)
-    theta = np.arctan(dyc_dx)
-    # Upper and lower surface coordinates
-    offset = (x[-1] - x[0])/2
-    xu = x - yt * np.sin(theta)#+ offset
-    yu = yc + yt * np.cos(theta) + offset
-    xl = x + yt * np.sin(theta)# + offset
-    yl = yc - yt * np.cos(theta) + offset
-
-    # Create the bit mask
-    airfoil_mask = np.zeros_like(X, dtype=bool)
-    interp_yl = interp1d(xl, yl, bounds_error=False, fill_value=0.0)
-    interp_yu = interp1d(xu, yu, bounds_error=False, fill_value=0.0)
-    
-    airfoil_mask[(interp_yl(Y - (offset/4)) <= X) & (interp_yu(Y - (offset/4)) >= X)] = True
-    return airfoil_mask
