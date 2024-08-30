@@ -9,6 +9,9 @@ import subprocess
 import os 
 from multiprocessing.pool import Pool
 
+
+FRAME_FILE = 'frames.txt'
+
 # Sources:
 # Stable Fluids, Stam 1999   https://pages.cs.wisc.edu/~chaol/data/cs777/stam-stable_fluids.pdf
 # Fast Fluid Dynamics Simulation on the GPU, Harris 2004           https://cg.informatik.uni-freiburg.de/intern/seminar/gridFluids_GPU_Gems.pdf
@@ -44,7 +47,7 @@ def navier_stokes(x_range, n, t_max, iters, num_particles, chunk_size, name, ini
     ]
     offsets = np.array([0,1,-1])
     # this is the block triangular matrix that will compose the poisson matrix
-    # Note that we use sparse arrays here because they are WAY too big to store literally
+    # Note that we use sparse arrays here because they are WAY too big to store densely
     D_sparse = diags_array(diagonals, offsets=offsets, format='csc')
     offdiag1 = diags_array([[-1] * (n**2 - n)], offsets=[n], format='csc')
     offdiag2 = diags_array([[-1] * (n**2 - n)], offsets=[-n], format='csc')
@@ -85,8 +88,12 @@ def navier_stokes(x_range, n, t_max, iters, num_particles, chunk_size, name, ini
         W0 = U[1]
         ########################################    FORCING      ################################################
         for f in F:
-            W0 = f(W0, row_idx, col_idx, i*dt)
-        
+            W0 = f(W0, t=i*dt, t_max=t_max)
+        # dummy_arr = np.zeros(W0[:,:,0].shape)[:,:, np.newaxis]
+        # plt.imshow(np.dstack((W0, dummy_arr)))
+        # plt.axis('off')  # Turn off the axis labels
+        # plt.show()
+        # raise Exception("stop here")
         U[2] = W1 = W0
         ########################################    ADVECTION    ################################################
         # find the index of each particle's velocity one step ago:
@@ -136,54 +143,26 @@ def navier_stokes(x_range, n, t_max, iters, num_particles, chunk_size, name, ini
             
         # particle_positions = particle_positions_new
         # start a process drawing a new frame:
-        async_frame = pool.apply_async(draw_frame, args=(x_range, np.copy(U[0]), np.copy(particle_positions), np.copy(p)))
-        #async_frame = draw_frame(x_range, U[0], particle_positions, p)
-        async_frames.append(async_frame)
-        
-        # if we have enough processes drawing frames, then 
-        if len(async_frames) == chunk_size:
-            render_section(1 + i - chunk_size, 1 + i, async_frames)
+        #draw_frame(x_range, np.copy(U[0]), None, np.copy(p))
+        #raise Exception("stop here")
+        new_frame_future = pool.apply_async(draw_frame, args=(x_range, np.copy(U[0]), None, np.copy(p)))
+        async_frames.append(new_frame_future)
+        if i % chunk_size == 0:
+            save_frames_bin(async_frames, name)
             async_frames = []
-    
-
-
-
-    render(name, chunk_size, iters)
-    for start_frame in range(0, iters, chunk_size):
-        end_frame = min(start_frame + chunk_size, iters)
-        os.remove(f"ffmpeg_temp/{start_frame}_{end_frame}.mp4")
-
-    os.rmdir('ffmpeg_temp')
+    pool.close()
+    pool.join()
+    render2(async_frames, name)
     pool.terminate()
 
+def save_frames_bin(async_frames, name):
+    with open(FRAME_FILE, 'wb') as f:
+        for async_frame in async_frames:
+            f.write(async_frame.get())
+    return
 
-
-
-def render(name, chunk_size, iters):
-    file_list = f'file_list.txt'
-    with open(file_list, 'w') as f:
-        for start_frame in range(0, iters, chunk_size):
-            end_frame = min(start_frame + chunk_size, iters)
-            f.write(f"file 'ffmpeg_temp/{start_frame}_{end_frame}.mp4'\n")
-    
-    # Construct the FFmpeg command
-    ffmpeg_cmd = [
-        'ffmpeg',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', file_list,
-        '-c', 'copy',
-        f'{name}.mp4'
-    ]
-
-    # Run the FFmpeg command
-    subprocess.run(ffmpeg_cmd, check=True)
-    os.remove(file_list)
-
-
-
-def render_section(start_frame, end_frame, async_frames):
-    #fig, (mag_ax, particle_ax, pressure_ax) = plt.subplots(nrows=3, ncols=1, figsize=(4, 14), sharex=True, subplot_kw={'xticks': [], 'yticks': []}, layout='constrained')
+def render2(async_frames, name):
+     #fig, (mag_ax, particle_ax, pressure_ax) = plt.subplots(nrows=3, ncols=1, figsize=(4, 14), sharex=True, subplot_kw={'xticks': [], 'yticks': []}, layout='constrained')
     fig, (mag_ax, pressure_ax) = plt.subplots(nrows=2, ncols=1, figsize=(4, 9), sharex=True, subplot_kw={'xticks': [], 'yticks': []}, layout='constrained')    
     # Define the initial frame
     fig.colorbar(cm.ScalarMappable(cmap='viridis'), ax=mag_ax, shrink=0.8, orientation='horizontal', pad=0.02)
@@ -200,28 +179,42 @@ def render_section(start_frame, end_frame, async_frames):
         '-b:v', '0',
         '-crf', '10',
         '-preset', 'veryslow',
-        f'ffmpeg_temp/{start_frame}_{end_frame}.mp4'
+        f'{name}.mp4'
     ]
     # Run FFmpeg with input data piped to stdin
     sub_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with open(FRAME_FILE, 'rb') as f:  # Note: 'rb' for binary mode
+        while True:
+            chunk = f.read(8192)  # Read 8KB at a time
+            if not chunk:
+                break
+            try:
+                sub_process.stdin.write(chunk)
+            except Exception as e:
+                print(f"Error writing chunk {chunk}")
+                stderr_data = sub_process.stderr.read()
+                if stderr_data:
+                    print(f"FFmpeg stderr: {stderr_data.decode('utf-8')}")
+                break    
+
+    # shove all of the frames still in memory into ffmpeg
     for async_frame in async_frames:
-        frame_data = async_frame.get()
-        # try to force feed the frame bytes through the stdin. If it doesn't work, print the error
-        try:
-            sub_process.stdin.write(frame_data)
-        except Exception as e:
-            print(f"Error writing chunk {start_frame}_{end_frame}: {e}")
-            stderr_data = sub_process.stderr.read()
-            if stderr_data:
-                print(f"FFmpeg stderr: {stderr_data.decode('utf-8')}")
-            break
-    
+            try:
+                sub_process.stdin.write(async_frame.get())
+            except Exception as e:
+                print(f"Error writing from memory")
+                stderr_data = sub_process.stderr.read()
+                if stderr_data:
+                    print(f"FFmpeg stderr: {stderr_data.decode('utf-8')}")
+                break    
+
     sub_process.stdin.close()
     stdout_data, stderr_data = sub_process.communicate()
     if sub_process.returncode != 0:
         print(f"FFmpeg error: {stderr_data.decode('utf-8')}")
     # close all figures that are still open for any reason:
   #  plt.close('all')
+    return
 
 # Function to update the plot
 def draw_frame(x_range, u, particle_positions, pressure):

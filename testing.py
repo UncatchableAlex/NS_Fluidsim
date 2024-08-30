@@ -1,6 +1,7 @@
 from ns import navier_stokes
 import numpy as np
 from scipy.interpolate import interp1d
+from scipy.ndimage import rotate
 import matplotlib as plt
 from matplotlib import cm, colors
 
@@ -9,8 +10,8 @@ def boundaries(u, row_idx, col_idx, t):
    # u[2:-2, -2:] = 0
     return u
 
-def left(u, row_idx, col_idx, t, amplitude=5):
-    u[:, 0:5, 0] = amplitude
+def left(u, t,t_max, amplitude=5):
+    u[:, 0:30, 1] = amplitude
     return u
 
 
@@ -35,11 +36,11 @@ def _NACA_airfoil(x, t, m, p ,r):
     ) * (x > p)
     theta = np.arctan(dyc_dx)
     # Upper and lower surface coordinates
-    offset = (x[-1] - x[0]) / 2
+    offset_vert = (x[-1] - x[0]) / 2
     xu = x - yt * np.sin(theta)  # + offset
-    yu = yc + yt * np.cos(theta) + offset
+    yu = yc + yt * np.cos(theta)# + offset_vert
     xl = x + yt * np.sin(theta)  # + offset
-    yl = yc - yt * np.cos(theta) + offset
+    yl = yc - yt * np.cos(theta) #+ offset_vert
 
     # Create the bit mask
     interp_yl = interp1d(xl, yl, bounds_error=False, fill_value=0.0)
@@ -48,12 +49,32 @@ def _NACA_airfoil(x, t, m, p ,r):
 
 
 
-def NACA_airfoil(u, row_idx, col_idx, t, m=0.06, p=0.4, r=0.09):
-    x = col_idx[0]
+def NACA_airfoil(u, t, t_max, m=0.06, p=0.4, r=0.09, aoa=10):
+    aoa = (-25*(t-2)/t_max)-3 if t > 2 else -3 
+    y = np.linspace(-1,1,len(u))
+    x = np.linspace(-1,1,len(u))
+
+    x2,y2 = np.meshgrid(x,y)
     interp_yl, interp_yu = _NACA_airfoil(x, t, m, p, r)
-    offset = (x[-1] - x[0]) / 2
-    u[(interp_yl(col_idx - (offset / 4)) <= row_idx) & (interp_yu(col_idx - (offset / 4)) >= row_idx)] = 0
+
+    # transform our aoa to radians
+    rad_aoa = np.deg2rad(aoa)
+
+    # apply a rotation matrix (linear algebra moment)
+    rot = lambda a, b: (a*np.cos(rad_aoa) - b*np.sin(rad_aoa), a*np.sin(rad_aoa) + b*np.cos(rad_aoa))
+    rot_x_yl, rot_yl = rot(x,interp_yl(x+0.5)) # we translate the wing left by 0.5 to put its center at the origin (around which the rotation occurs)
+    rot_x_yu, rot_yu = rot(x,interp_yu(x+0.5)) # this effectively results in the wing rotating around its center (as opposed to around the leading edge which was at the origin before)
+
+    # make interpolators that capture our rotation transformation
+    interp_rot_yl = interp1d(rot_x_yl, rot_yl, bounds_error=False, fill_value=0.0)
+    interp_rot_yu = interp1d(rot_x_yu, rot_yu, bounds_error=False, fill_value=0.0)
+    
+    # apply our rotation interpolators to our x grid, and select coords in between the top and bottom of the wing
+    u[(interp_rot_yl(x2) < y2) & (interp_rot_yu(x2) > y2)] = 0
     return u
+
+def stats(u, p, row_idx, col_idx, t):
+    pass
 
 
 
@@ -108,25 +129,25 @@ def draw_frame(x_range, u, particle_positions, pressure):
 
 
 def test():
-    x_range = (0, 1.2)
-    iters = 100
-    n = 100
+    x_range = (-1, 1)
+    n = 300
     viscosity = 0
     viscosity = 1.48 * 1e-5  # air at 15c
     # viscosity = 0.001139  #water at 15c
     # viscosity = 0.000282  #water at 100c
-    t_max = 5
+    t_max = 15
+    iters = 60 * t_max
     navier_stokes(
         x_range=x_range,
         n=n,
         t_max=t_max,
         iters=iters,
         num_particles=1e5,
-        chunk_size=10,
-        name="wing7",
+        chunk_size=900,
+        name="wing8",
         viscosity=viscosity,
-        init_U_func=lambda x, y: (0.3, 0),
-        F=[left],
+        init_U_func=lambda x, y: (1, 0),
+        F=[NACA_airfoil, left],
        # draw_frame=draw_frame
     )
 
